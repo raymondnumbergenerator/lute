@@ -18,8 +18,8 @@ local function hasPackage(key: string): boolean
 	return fs.exists(getPackagePath(key))
 end
 
-local function getRegistryIdentity(registryUrlValue: string): string
-	local digest = crypto.digest(crypto.hash.sha256, registryUrl.normalize(registryUrlValue))
+local function sha256Hex(value: string): string
+	local digest = crypto.digest(crypto.hash.sha256, value)
 	local hex = {}
 
 	for index = 0, buffer.len(digest) - 1 do
@@ -27,6 +27,22 @@ local function getRegistryIdentity(registryUrlValue: string): string
 	end
 
 	return table.concat(hex)
+end
+
+local function getRegistryIdentity(registryUrlValue: string): string
+	return sha256Hex(registryUrl.normalize(registryUrlValue))
+end
+
+-- Returns the store key of a GitHub checkout. Checkouts are keyed by
+-- repository and revision, not by package, so every package selected from one
+-- repository at one revision (with different `target`s) shares one download.
+-- The repository name is kept for readability; the URL hash keeps repositories
+-- with the same name apart. Example: "repo--github-<sha256>@v1.0.0".
+local function getGitHubCheckoutKey(source: string, rev: string): string
+	local trimmed = string.gsub(source, "/+$", "")
+	local repositoryName = string.match(trimmed, "([^/]+)$") or "repository"
+	repositoryName = string.gsub(repositoryName, "%.git$", "")
+	return `{repositoryName}--github-{sha256Hex(trimmed)}@{rev}`
 end
 
 local function qualifyRegistryKey(key: string, registryUrlValue: string): string
@@ -56,6 +72,7 @@ return {
 	hasPackage = hasPackage,
 	getRegistryIdentity = getRegistryIdentity,
 	qualifyRegistryKey = qualifyRegistryKey,
+	getGitHubCheckoutKey = getGitHubCheckoutKey,
 	ensureStoreDirectory = ensureStoreDirectory,
 	toStorePath = toStorePath,
 }

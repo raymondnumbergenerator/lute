@@ -1,6 +1,7 @@
 local fs = require("@std/fs")
 local luau = require("@std/luau")
 local manifest = require("./manifest")
+local path = require("@std/path")
 local registryUrlUtil = require("./registryurl")
 local semver = require("./semver")
 local store = require("./store")
@@ -8,20 +9,44 @@ local store = require("./store")
 export type LockfileDependency = {
 	read name: string,
 	read rev: string?,
+	-- GitHub only: the package's directory inside the repository, as declared by
+	-- the dependency's `target`. Nil for the repository root.
+	read target: string?,
 	read source: string,
 	read sourceKind: manifest.SourceKind,
 	read installPath: string,
 	read dependencies: { [string]: string },
+	-- Development dependency aliases, recorded only for members: the direct path
+	-- dependencies of a virtual install root. Nil for every other package,
+	-- including members resolved with `--exclude-dev`. Kept separate from
+	-- `dependencies` so installs can exclude them without re-reading manifests.
+	read devDependencies: { [string]: string }?,
 	read registry: string?,
 }
 
+-- Version 4 differs from version 3 only in the `devDependencies` maps, at the
+-- root and on member records. Version 3 mixed root development dependencies
+-- into `dependencies`, so telling them apart required the manifest.
 export type Lockfile = {
 	read version: number,
 	read packages: { [string]: LockfileDependency },
 	read dependencies: { [string]: string },
+	-- Root development dependency aliases. Absent in version 3 lockfiles.
+	read devDependencies: { [string]: string }?,
 	read overrides: { [string]: string }?,
 	read registry: string?,
 }
+
+-- Validates an alias -> package key map (a `dependencies` or `devDependencies`
+-- table) and freezes it.
+local function validateAliasMap(map: any, description: string)
+	assert(typeof(map) == "table", `Expected {description} to be a table`)
+	for alias, depKey in map do
+		assert(typeof(alias) == "string", `Expected alias to be a string in {description}`)
+		assert(typeof(depKey) == "string", `Expected dependency key to be a string in {description}`)
+	end
+	table.freeze(map)
+end
 
 local function validatePackageEntry(key: string, entry: any)
 	assert(typeof(entry) == "table", `Expected table for dependency '{key}'`)
@@ -30,18 +55,21 @@ local function validatePackageEntry(key: string, entry: any)
 		entry.rev == nil or typeof(entry.rev) == "string",
 		`Expected 'rev' field to be a string or nil for dependency '{key}'`
 	)
+	assert(
+		entry.target == nil or typeof(entry.target) == "string",
+		`Expected 'target' field to be a string or nil for dependency '{key}'`
+	)
 	assert(typeof(entry.source) == "string", `Expected 'source' field in dependency '{key}'`)
 	assert(
 		manifest.isSourceKind(entry.sourceKind),
 		`Expected 'sourceKind' to be 'path', 'github', or 'registry' for dependency '{key}', got '{entry.sourceKind}'`
 	)
 	assert(typeof(entry.installPath) == "string", `Expected 'installPath' field in dependency '{key}'`)
-	assert(typeof(entry.dependencies) == "table", `Expected 'dependencies' field in dependency '{key}'`)
-	for alias, depKey in entry.dependencies do
-		assert(typeof(alias) == "string", `Expected alias to be a string for dependency '{key}'`)
-		assert(typeof(depKey) == "string", `Expected dependency key to be a string for dependency '{key}'`)
+	assert(entry.dependencies ~= nil, `Expected 'dependencies' field in dependency '{key}'`)
+	validateAliasMap(entry.dependencies, `'dependencies' of '{key}'`)
+	if entry.devDependencies ~= nil then
+		validateAliasMap(entry.devDependencies, `'devDependencies' of '{key}'`)
 	end
-	table.freeze(entry.dependencies)
 	assert(
 		entry.registry == nil or typeof(entry.registry) == "string",
 		`Expected 'registry' field to be a string or nil for dependency '{key}'`
@@ -50,7 +78,13 @@ end
 
 local function parseLockfile(t: any): Lockfile
 	assert(t ~= nil and typeof(t) == "table", "Expected lockfile to be a table")
-	assert(t.version == 3, `Unsupported lockfile version: {t.version}`)
+	-- Version 3 is still accepted so that upgrading keeps the locked registry
+	-- versions: a parse failure would make `tryParseFile` treat the lock as
+	-- absent and re-resolve every registry dependency to its newest version.
+	-- A version 3 lock with root development dependencies fails
+	-- `satisfiesManifest` (they appear in `dependencies`, not `devDependencies`)
+	-- and is re-resolved into version 4, using its versions as preferences.
+	assert(t.version == 3 or t.version == 4, `Unsupported lockfile version: {t.version}`)
 	assert(typeof(t.packages) == "table", "Expected 'packages' field in lockfile")
 	assert(typeof(t.dependencies) == "table", "Expected 'dependencies' field in lockfile")
 
@@ -60,12 +94,15 @@ local function parseLockfile(t: any): Lockfile
 	end
 	table.freeze(t.packages)
 
-	for alias, key in t.dependencies do
-		assert(typeof(alias) == "string", "Expected dependency alias to be a string")
-		assert(typeof(key) == "string", "Expected dependency key to be a string")
-		assert(t.packages[key] ~= nil, `Dependency '{alias}' references package '{key}' which is not in packages`)
+	-- Every root alias, development or not, must reference a recorded package.
+	for _, rootMap in { t.dependencies, t.devDependencies } do
+		for alias, key in rootMap do
+			assert(typeof(alias) == "string", "Expected dependency alias to be a string")
+			assert(typeof(key) == "string", "Expected dependency key to be a string")
+			assert(t.packages[key] ~= nil, `Dependency '{alias}' references package '{key}' which is not in packages`)
+		end
+		table.freeze(rootMap)
 	end
-	table.freeze(t.dependencies)
 
 	if t.overrides ~= nil then
 		assert(typeof(t.overrides) == "table", "Expected 'overrides' field to be a table")
@@ -136,63 +173,120 @@ local function getEffectiveRootSpec(
 	return overrides[spec.name] or spec
 end
 
-local function satisfiesManifest(
-	lock: Lockfile,
-	rootManifest: manifest.ProjectManifest,
-	excludeDev: boolean
-): (boolean, string?)
-	local expectedAliases: { [string]: manifest.DependencySpec } = {}
+-- Whether a locked package comes from the same source as a spec: the same
+-- source kind and source, plus `rev` and `target` for GitHub. Path and GitHub
+-- packages are both a source root plus a directory inside it, so this is the
+-- whole identity of either. A locked path is relative to the install root and
+-- a spec carries the absolute `directory` resolved by the parser, so the
+-- locked path is resolved before comparing. Registry callers check the locked
+-- version separately.
+local function isSameSource(pkg: LockfileDependency, spec: manifest.DependencySpec, rootDirectory: string): boolean
+	if pkg.sourceKind ~= spec.sourceKind then
+		return false
+	end
+	if spec.sourceKind == "path" then
+		return path.format(path.resolve(rootDirectory, pkg.source)) == spec.directory
+	end
+	if pkg.source ~= spec.source then
+		return false
+	end
+	if spec.sourceKind == "github" then
+		return pkg.rev == spec.rev and pkg.target == spec.target
+	end
+	return true
+end
 
-	for alias, spec in rootManifest.package.dependencies do
-		expectedAliases[alias] = spec
+-- Checks that the package locked for one root alias still matches the alias's
+-- effective spec (after overrides). Returns false and a reason on mismatch.
+local function lockedEntryMatches(
+	lock: Lockfile,
+	alias: string,
+	key: string,
+	spec: manifest.DependencySpec,
+	rootDirectory: string
+): (boolean, string?)
+	local pkg = lock.packages[key]
+	if pkg == nil then
+		return false, `broken lockfile entry for: {alias}`
 	end
 
-	if not excludeDev then
-		for alias, spec in rootManifest.package.devDependencies do
-			expectedAliases[alias] = spec
+	if not isSameSource(pkg, spec, rootDirectory) then
+		return false, `{spec.sourceKind} source changed for: {alias}`
+	end
+
+	if spec.sourceKind == "registry" then
+		local constraint = semver.parseConstraint(spec.version)
+		local lockedVersion = semver.tryParse(pkg.rev :: string)
+		if lockedVersion == nil or not semver.satisfies(lockedVersion, constraint) then
+			return false, `registry constraint no longer satisfied for: {alias}`
 		end
 	end
 
-	for alias, spec in expectedAliases do
-		spec = getEffectiveRootSpec(spec, rootManifest.overrides)
+	return true, nil
+end
 
-		local key = lock.dependencies[alias]
+-- Checks one root alias map against the manifest section it was resolved from:
+-- every declared alias must be locked and still match, and no locked alias may
+-- have been removed from the manifest.
+local function aliasMapMatches(
+	locked: { [string]: string },
+	expected: { [string]: manifest.DependencySpec },
+	lock: Lockfile,
+	overrides: { [string]: manifest.DependencySpec },
+	rootDirectory: string
+): (boolean, string?)
+	for alias, spec in expected do
+		local key = locked[alias]
 		if key == nil then
 			return false, `new dependency: {alias}`
 		end
 
-		local pkg = lock.packages[key]
-		if pkg == nil then
-			return false, `broken lockfile entry for: {alias}`
-		end
-
-		if pkg.sourceKind ~= spec.sourceKind then
-			return false, `source kind changed for: {alias}`
-		end
-
-		if spec.sourceKind == "github" then
-			if pkg.source ~= spec.source or pkg.rev ~= spec.rev then
-				return false, `github source changed for: {alias}`
-			end
-		elseif spec.sourceKind == "path" then
-			if pkg.source ~= spec.source then
-				return false, `path changed for: {alias}`
-			end
-		elseif spec.sourceKind == "registry" then
-			if pkg.source ~= spec.source then
-				return false, `registry source changed for: {alias}`
-			end
-			local constraint = semver.parseConstraint(spec.version)
-			local lockedVersion = semver.tryParse(pkg.rev :: string)
-			if lockedVersion == nil or not semver.satisfies(lockedVersion, constraint) then
-				return false, `registry constraint no longer satisfied for: {alias}`
-			end
+		local ok, reason = lockedEntryMatches(lock, alias, key, getEffectiveRootSpec(spec, overrides), rootDirectory)
+		if not ok then
+			return false, reason
 		end
 	end
 
-	for alias in lock.dependencies do
-		if expectedAliases[alias] == nil then
+	for alias in locked do
+		if expected[alias] == nil then
 			return false, `removed dependency: {alias}`
+		end
+	end
+
+	return true, nil
+end
+
+local function satisfiesManifest(
+	lock: Lockfile,
+	rootManifest: manifest.ProjectManifest,
+	rootDirectory: string,
+	excludeDev: boolean
+): (boolean, string?)
+	local ok, reason = aliasMapMatches(
+		lock.dependencies,
+		rootManifest.package.dependencies,
+		lock,
+		rootManifest.overrides,
+		rootDirectory
+	)
+	if not ok then
+		return false, reason
+	end
+
+	-- A full lock stays valid when development dependencies are excluded; only
+	-- check them when they will be installed. Because they live in their own
+	-- map, skipping them cannot make the "removed dependency" check above fire
+	-- for dev aliases, which is what broke `--locked --exclude-dev` in version 3.
+	if not excludeDev then
+		ok, reason = aliasMapMatches(
+			lock.devDependencies or {},
+			rootManifest.package.devDependencies,
+			lock,
+			rootManifest.overrides,
+			rootDirectory
+		)
+		if not ok then
+			return false, reason
 		end
 	end
 
@@ -218,7 +312,11 @@ local function satisfiesManifest(
 	return true, nil
 end
 
-local function getReachablePackageKeys(lock: Lockfile, rootAliases: { [string]: boolean }): { [string]: boolean }
+-- Returns the keys of every package reachable from the root aliases. With
+-- `includeDev`, development edges are followed too: the root's and each
+-- member's. Members' own development dependencies do not recurse further,
+-- since only members record a `devDependencies` map.
+local function getReachablePackageKeys(lock: Lockfile, includeDev: boolean): { [string]: boolean }
 	local reachable: { [string]: boolean } = {}
 
 	local function visit(key: string)
@@ -232,12 +330,19 @@ local function getReachablePackageKeys(lock: Lockfile, rootAliases: { [string]: 
 			for _, dependencyKey in pkg.dependencies do
 				visit(dependencyKey)
 			end
+			if includeDev and pkg.devDependencies then
+				for _, dependencyKey in pkg.devDependencies do
+					visit(dependencyKey)
+				end
+			end
 		end
 	end
 
-	for alias in rootAliases do
-		local key = lock.dependencies[alias]
-		if key then
+	for _, key in lock.dependencies do
+		visit(key)
+	end
+	if includeDev and lock.devDependencies then
+		for _, key in lock.devDependencies do
 			visit(key)
 		end
 	end
@@ -249,6 +354,7 @@ return {
 	parseFile = parseFile,
 	tryParseFile = tryParseFile,
 	satisfiesManifest = satisfiesManifest,
+	isSameSource = isSameSource,
 	getReachablePackageKeys = getReachablePackageKeys,
 	serializeOverrides = serializeOverrides,
 }

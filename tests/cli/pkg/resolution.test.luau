@@ -661,11 +661,12 @@ test.suite("DevDependencies", function(suite)
 
 		local lock = resolution.resolve(path.format(workingDirectory), nil)
 
-		assert.eq(lock.dependencies.testlib, "testlib")
+		assert.eq(lock.dependencies.testlib, nil)
+		assert.eq(lock.devDependencies and lock.devDependencies.testlib, "testlib")
 		assert.eq(lock.packages["testlib"], {
 			name = "testlib",
 			sourceKind = "path",
-			source = "./testlib",
+			source = "testlib",
 			installPath = "testlib",
 			dependencies = {},
 		})
@@ -703,16 +704,55 @@ test.suite("DevDependencies", function(suite)
 
 		local lock = resolution.resolve(path.format(workingDirectory), nil)
 
+		-- Only a virtual root's direct path dependencies resolve development
+		-- dependencies; a named root's path dependencies do not.
 		assert.eq(lock.dependencies.lib, "lib")
 		assert.eq(lock.packages["lib"], {
 			name = "lib",
 			sourceKind = "path",
-			source = "./lib",
+			source = "lib",
 			installPath = "lib",
 			dependencies = {},
 		})
 		assert.eq(lock.packages["libtest"], nil)
 		assert.eq(lock.dependencies.libtest, nil)
+	end)
+
+	suite:case("devDependenciesOfExternalPathDepsExcluded", function(assert)
+		local rootDir = path.join(workingDirectory, "root")
+		fs.createDirectory(rootDir)
+
+		local externalDir = path.join(workingDirectory, "external")
+		fs.createDirectory(externalDir)
+		local externalTestDir = path.join(externalDir, "externaltest")
+		fs.createDirectory(externalTestDir)
+		writeConfig(externalTestDir, "externaltest", "")
+		writeConfig(
+			externalDir,
+			"external",
+			"",
+			[[
+
+			externaltest = {
+				sourceKind = "path",
+				source = "./externaltest",
+			},]]
+		)
+		writeConfig(
+			rootDir,
+			"root",
+			[[
+
+			external = {
+				sourceKind = "path",
+				source = "../external",
+			},]]
+		)
+
+		local lock = resolution.resolve(path.format(rootDir), nil)
+
+		assert.eq(lock.packages["external"].devDependencies, nil)
+		assert.eq(lock.packages["externaltest"], nil)
 	end)
 
 	suite:case("devDependenciesOfTransitiveRegistryDepsExcluded", function(assert)
@@ -805,7 +845,7 @@ test.suite("DevDependencies", function(suite)
 		local lock = resolution.resolve(path.format(workingDirectory), nil)
 
 		assert.eq(lock.dependencies.lib, "lib")
-		assert.eq(lock.dependencies.testlib, "testlib")
+		assert.eq(lock.devDependencies and lock.devDependencies.testlib, "testlib")
 		assert.eq(lock.packages["shared"], {
 			name = "shared",
 			sourceKind = "path",
@@ -840,7 +880,7 @@ test.suite("DevDependencies", function(suite)
 
 		local lock = resolution.resolve(path.format(workingDirectory), universe)
 
-		assert.eq(lock.dependencies.testing, "testing@1.2.0")
+		assert.eq(lock.devDependencies and lock.devDependencies.testing, "testing@1.2.0")
 		assert.eq(lock.packages["testing@1.2.0"], {
 			name = "testing",
 			rev = "1.2.0",
@@ -905,7 +945,7 @@ test.suite("DevDependencies", function(suite)
 		assert.eq(lock.packages["lib"], {
 			name = "lib",
 			sourceKind = "path",
-			source = "./lib",
+			source = "lib",
 			installPath = "lib",
 			dependencies = {},
 		})
@@ -966,7 +1006,7 @@ test.suite("DevDependencies", function(suite)
 		end)
 	end)
 
-	suite:case("lockfileVersionRemainsThree", function(assert)
+	suite:case("lockfileVersionIsFour", function(assert)
 		local devDir = path.join(workingDirectory, "testlib")
 		fs.createDirectory(devDir)
 		writeConfig(devDir, "testlib", "")
@@ -986,7 +1026,7 @@ test.suite("DevDependencies", function(suite)
 
 		local lockfilePath = path.join(workingDirectory, "loom.lock.luau")
 		local content = fs.readFileToString(lockfilePath)
-		assert.strContains(content, "version = 3")
+		assert.strContains(content, "version = 4")
 	end)
 end)
 
@@ -2092,7 +2132,7 @@ test.suite("Overrides", function(suite)
 		assert.eq((lock.overrides :: any).citrus, "2.0.0")
 	end)
 
-	suite:case("lockfileVersionIsThreeWithOverrides", function(assert)
+	suite:case("lockfileVersionIsFourWithOverrides", function(assert)
 		writeConfig(
 			workingDirectory,
 			"root",
@@ -2120,7 +2160,7 @@ test.suite("Overrides", function(suite)
 		}
 
 		local lock = resolution.resolve(path.format(workingDirectory), universe)
-		assert.eq(lock.version, 3)
+		assert.eq(lock.version, 4)
 	end)
 
 	suite:case("reResolvesWhenOverrideAdded", function(assert)
@@ -2494,5 +2534,255 @@ test.suite("Overrides", function(suite)
 
 		local lock = resolution.resolve(path.format(workingDirectory), nil)
 		assert.eq(lock.registry, nil)
+	end)
+end)
+
+local function writeFile(dir: path.Path, contents: string)
+	fs.createDirectory(dir, { makeParents = true })
+	fs.writeStringToFile(path.join(dir, "loom.config.luau"), contents)
+end
+
+-- Fixture for the virtual package (workspace) prototype.
+-- repo/ is a virtual package listing modules/apple and modules/banana.
+-- banana depends on its sibling apple; apple has a local dev dependency.
+local function writeVirtualRepository(repoDir: path.Path, appleVersion: string?, bananaRequirement: string?)
+	writeFile(
+		repoDir,
+		[[return {
+	package = {
+		dependencies = {
+			apple = { sourceKind = "path", source = "./modules/apple" },
+			banana = { sourceKind = "path", source = "./modules/banana" },
+		},
+	},
+}
+]]
+	)
+	writeFile(
+		path.join(repoDir, "modules", "apple"),
+		string.format(
+			[[return {
+	package = {
+		name = "apple",
+		version = "%s",
+		dev_dependencies = {
+			helper = { sourceKind = "path", source = "../helper" },
+		},
+	},
+}
+]],
+			appleVersion or "1.0.0"
+		)
+	)
+	writeFile(path.join(repoDir, "modules", "helper"), [[return { package = { name = "helper", version = "1.0.0" } }]])
+	writeFile(
+		path.join(repoDir, "modules", "banana"),
+		string.format(
+			[[return {
+	package = {
+		name = "banana",
+		version = "1.0.0",
+		dependencies = {
+			apple = { sourceKind = "path", source = "../apple", version = "%s" },
+		},
+	},
+}
+]],
+			bananaRequirement or "^1.0.0"
+		)
+	)
+end
+
+-- Workspaces as virtual packages: a `package` without name/version whose path
+-- dependencies (members) resolve into one lockfile through ordinary resolution.
+test.suite("VirtualPackages", function(suite)
+	suite:beforeEach(function()
+		if fs.exists(workingDirectory) then
+			fs.removeDirectory(workingDirectory, { recursive = true })
+		end
+		fs.createDirectory(workingDirectory)
+	end)
+
+	-- Members, their sibling edges, and member dev dependencies all land in one
+	-- version 4 lockfile; the root's ./modules/apple and banana's ../apple are
+	-- normalized to the same source instead of conflicting.
+	suite:case("resolvesMembersIntoOneLockfile", function(assert)
+		local repoDir = path.join(workingDirectory, "repo")
+		writeVirtualRepository(repoDir)
+
+		local lock = resolution.resolve(path.format(repoDir), nil)
+
+		assert.eq(lock.version, 4)
+		assert.eq(lock.dependencies, { apple = "apple", banana = "banana" })
+		-- banana's sibling dependency and the root's listing resolve to one package.
+		assert.eq(lock.packages.banana.dependencies, { apple = "apple" })
+		assert.eq(lock.packages.apple.source, "modules/apple")
+		assert.eq(lock.packages.apple.devDependencies, { helper = "helper" })
+		assert.eq(lock.packages.helper.installPath, "modules/helper")
+	end)
+
+	-- A path override is resolved against the root manifest when it is parsed,
+	-- like the root's own path dependencies, so `./modules/apple` agrees with
+	-- banana's `../apple` and a second install reuses the lockfile.
+	suite:case("pathOverrideAgreesWithSiblingPath", function(assert)
+		local repoDir = path.join(workingDirectory, "repo")
+		writeVirtualRepository(repoDir)
+		writeFile(
+			repoDir,
+			[[return {
+	package = {
+		dependencies = {
+			banana = { sourceKind = "path", source = "./modules/banana" },
+		},
+	},
+	overrides = {
+		apple = { sourceKind = "path", source = "./modules/apple" },
+	},
+}
+]]
+		)
+
+		local lock = resolution.resolve(path.format(repoDir), nil)
+		assert.eq(lock.packages.banana.dependencies, { apple = "apple" })
+		assert.eq(lock.packages.apple.source, "modules/apple")
+
+		local reused = resolution.resolve(path.format(repoDir), nil, { locked = true })
+		assert.eq(reused.packages.apple.source, "modules/apple")
+	end)
+
+	-- Only the virtual root's direct path dependencies are members.
+	suite:case("membersTransitivePathDependenciesSkipDevDependencies", function(assert)
+		local repoDir = path.join(workingDirectory, "repo")
+		writeVirtualRepository(repoDir)
+		-- helper is apple's dev dependency, not a member, so its own dev
+		-- dependency is not resolved.
+		writeFile(
+			path.join(repoDir, "modules", "helpertest"),
+			[[return { package = { name = "helpertest", version = "1.0.0" } }]]
+		)
+		writeFile(
+			path.join(repoDir, "modules", "helper"),
+			[[return {
+	package = {
+		name = "helper",
+		version = "1.0.0",
+		dev_dependencies = {
+			helpertest = { sourceKind = "path", source = "../helpertest" },
+		},
+	},
+}
+]]
+		)
+
+		local lock = resolution.resolve(path.format(repoDir), nil)
+
+		assert.eq(lock.packages.apple.devDependencies, { helper = "helper" })
+		assert.eq(lock.packages.helper.devDependencies, nil)
+		assert.eq(lock.packages.helpertest, nil)
+	end)
+
+	-- --exclude-dev resolves no member dev maps and no dev-only packages.
+	suite:case("excludeDevSkipsLocalDevDependencies", function(assert)
+		local repoDir = path.join(workingDirectory, "repo")
+		writeVirtualRepository(repoDir)
+
+		local lock = resolution.resolve(path.format(repoDir), nil, { excludeDev = true })
+
+		assert.eq(lock.packages.apple.devDependencies, nil)
+		assert.eq(lock.packages.helper, nil)
+	end)
+
+	-- A full lock stays valid under --exclude-dev because dev aliases live in
+	-- their own maps (the version 3 "Full locks fail" bug).
+	suite:case("lockedExcludeDevReusesFullLockfile", function(assert)
+		local repoDir = path.join(workingDirectory, "repo")
+		writeVirtualRepository(repoDir)
+		local fullLock = resolution.resolve(path.format(repoDir), nil)
+
+		local reused = resolution.resolve(path.format(repoDir), nil, { excludeDev = true, locked = true })
+
+		assert.eq(reused.packages.helper ~= nil, true)
+		assert.eq(reused.dependencies, fullLock.dependencies)
+	end)
+
+	-- apple is first reached from the root without a version, so this also
+	-- covers checking the requirement on every edge.
+	suite:case("rejectsUnsatisfiedPathVersion", function(assert)
+		local repoDir = path.join(workingDirectory, "repo")
+		writeVirtualRepository(repoDir, nil, "^2.0.0")
+
+		assert.throwsWith("Path dependency 'apple' requires version ^2.0.0, but 'modules/apple' is 1.0.0", function()
+			resolution.resolve(path.format(repoDir), nil)
+		end)
+	end)
+
+	-- The lockfile does not record a path target's version, so reuse must
+	-- re-check it.
+	suite:case("pathVersionChangeInvalidatesLockfile", function(assert)
+		local repoDir = path.join(workingDirectory, "repo")
+		writeVirtualRepository(repoDir)
+		resolution.resolve(path.format(repoDir), nil)
+
+		writeVirtualRepository(repoDir, "2.0.0")
+
+		assert.throwsWith("Path dependency 'apple' requires version ^1.0.0, but 'modules/apple' is 2.0.0", function()
+			resolution.resolve(path.format(repoDir), nil)
+		end)
+	end)
+
+	-- A consumer points at a member's directory directly; the member's own
+	-- sibling path dependency is resolved relative to it.
+	suite:case("dependsOnMemberDirectoryDirectly", function(assert)
+		local repoDir = path.join(workingDirectory, "repo")
+		writeVirtualRepository(repoDir)
+		local consumerDir = path.join(workingDirectory, "consumer")
+		writeFile(
+			consumerDir,
+			[[return {
+	package = {
+		name = "consumer",
+		version = "1.0.0",
+		dependencies = {
+			banana = { sourceKind = "path", source = "../repo/modules/banana" },
+		},
+	},
+}
+]]
+		)
+
+		local lock = resolution.resolve(path.format(consumerDir), nil)
+
+		assert.eq(lock.dependencies.banana, "banana")
+		assert.eq(lock.packages.banana.installPath, "../repo/modules/banana")
+		assert.eq(lock.packages.banana.dependencies, { apple = "apple" })
+		-- Not a member of the consumer, so apple's dev dependencies are not resolved.
+		assert.eq(lock.packages.apple.devDependencies, nil)
+	end)
+
+	-- Virtual packages cannot be depended on; there is no selection by name.
+	suite:case("rejectsDependencyOnVirtualPackage", function(assert)
+		local repoDir = path.join(workingDirectory, "repo")
+		writeVirtualRepository(repoDir)
+		local consumerDir = path.join(workingDirectory, "consumer")
+		writeFile(
+			consumerDir,
+			[[return {
+	package = {
+		name = "consumer",
+		version = "1.0.0",
+		dependencies = {
+			banana = { sourceKind = "path", source = "../repo" },
+		},
+	},
+}
+]]
+		)
+
+		assert.throwsWith(
+			"'banana' points at a virtual package, which cannot be depended on; point at one of its packages' directories instead (for GitHub, set 'target')",
+			function()
+				resolution.resolve(path.format(consumerDir), nil)
+			end
+		)
 	end)
 end)

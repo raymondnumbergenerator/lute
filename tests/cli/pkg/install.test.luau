@@ -200,7 +200,7 @@ test.suite("LutePkgInstall", function(suite)
 		run(workingDirectory)
 
 		local lockfile = fs.readFileToString(path.join(workingDirectory, "loom.lock.luau"))
-		assert.strContains(lockfile, "version = 3")
+		assert.strContains(lockfile, "version = 4")
 		assert.strContains(lockfile, '"path"')
 		assert.strContains(lockfile, "installPath")
 	end)
@@ -313,5 +313,70 @@ test.suite("LutePkgInstall", function(suite)
 		assert.eq(archiveRequests, 1)
 
 		instance.close()
+	end)
+
+	-- A GitHub dependency on one package of a repository that groups several
+	-- under a virtual package. The checkout is pre-populated in a temporary
+	-- store, so no network access is needed.
+	suite:case("installsGitHubTargetFromSharedCheckout", function(assert)
+		local source = "https://github.com/owner/fruit"
+		local homeDirectory = path.join(workingDirectory, "home")
+		local checkoutKey = store.getGitHubCheckoutKey(source, "v1")
+		local checkout = path.join(homeDirectory, ".loom", "store", checkoutKey)
+		local appleDir = path.join(checkout, "modules", "apple")
+		local bananaDir = path.join(checkout, "modules", "banana")
+		fs.createDirectory(appleDir, { makeParents = true })
+		fs.createDirectory(bananaDir, { makeParents = true })
+
+		-- The repository's virtual root and its two packages; banana depends on
+		-- its sibling through a path.
+		fs.writeStringToFile(
+			path.join(checkout, "loom.config.luau"),
+			[[return { package = { dependencies = {
+	apple = { sourceKind = "path", source = "./modules/apple" },
+	banana = { sourceKind = "path", source = "./modules/banana" },
+} } }
+]]
+		)
+		writeConfig(appleDir, "apple", "")
+		fs.writeStringToFile(path.join(appleDir, "init.luau"), 'return "apple"\n')
+		writeConfig(
+			bananaDir,
+			"banana",
+			[[
+
+			apple = { sourceKind = "path", source = "../apple" },]]
+		)
+		fs.writeStringToFile(path.join(bananaDir, "init.luau"), 'return "banana sees " .. require("@apple")\n')
+
+		writeConfig(
+			workingDirectory,
+			"consumer",
+			`\n\t\t\tbanana = \{ sourceKind = "github", source = "{source}", rev = "v1", target = "modules/banana" },`
+		)
+		fs.writeStringToFile(path.join(workingDirectory, "main.luau"), 'print(require("@banana"))\n')
+
+		local env = setmetatable({
+			HOME = path.format(homeDirectory),
+			USERPROFILE = path.format(homeDirectory),
+		}, { __index = process.env })
+
+		local result = runWithEnv(workingDirectory, env)
+		assert.eq(result.exitcode, 0)
+
+		-- Both packages come from the one shared checkout, and banana's sibling
+		-- path became a GitHub dependency on it with apple's directory as target.
+		local lockfile = fs.readFileToString(path.join(workingDirectory, "loom.lock.luau"))
+		assert.strContains(lockfile, `installPath = "@pkg/{checkoutKey}/modules/banana"`)
+		assert.strContains(lockfile, `installPath = "@pkg/{checkoutKey}/modules/apple"`)
+		assert.strContains(lockfile, 'target = "modules/apple"')
+		assert.strContains(lockfile, 'apple = "apple@v1"')
+
+		local run = process.run(
+			{ lutePath, "pkg", "run", "main.luau" },
+			{ cwd = path.format(workingDirectory), env = env }
+		)
+		assert.eq(run.exitcode, 0)
+		assert.strContains(run.stdout, "banana sees apple")
 	end)
 end)

@@ -106,3 +106,103 @@ test.suite("PackageManifest", function(suite)
 		end)
 	end)
 end)
+
+-- A virtual package is a `package` without name/version; see PackageManifest.
+test.suite("VirtualPackage", function(suite)
+	suite:beforeEach(function()
+		if fs.exists(workingDirectory) then
+			fs.removeDirectory(workingDirectory, { recursive = true })
+		end
+		fs.createDirectory(workingDirectory)
+	end)
+
+	suite:case("parsesPackageWithoutNameOrVersion", function(assert)
+		writeManifest([[return {
+	package = {
+		dependencies = {
+			apple = { sourceKind = "path", source = "./modules/apple" },
+		},
+		dev_dependencies = {
+			orange = "^1.0.0",
+		},
+	},
+	common = { version = "1.0.0" },
+}
+]])
+
+		local parsed = manifest.parseFile(path.format(manifestPath))
+
+		assert.eq(parsed.package.name, nil)
+		assert.eq(parsed.package.version, nil)
+		assert.eq(parsed.package.dependencies.apple.source, "./modules/apple")
+		assert.eq(parsed.package.devDependencies.orange.sourceKind, "registry")
+	end)
+
+	suite:case("rejectsNameWithoutVersion", function(assert)
+		writeManifest([[return {
+	package = { name = "root" },
+}
+]])
+
+		assert.throwsWith("A package declares both 'name' and 'version', or neither for a virtual package", function()
+			manifest.parseFile(path.format(manifestPath))
+		end)
+	end)
+
+	suite:case("parsesPathDependencyVersion", function(assert)
+		writeManifest([[return {
+	package = {
+		name = "banana",
+		version = "1.0.0",
+		dependencies = {
+			apple = { sourceKind = "path", source = "../apple", version = "^1.0.0" },
+		},
+	},
+}
+]])
+
+		local parsed = manifest.parseFile(path.format(manifestPath))
+		local apple = parsed.package.dependencies.apple :: manifest.PathDependencySpec
+
+		assert.eq(apple.version, "^1.0.0")
+	end)
+
+	-- `target` names a package directory inside a GitHub repository.
+	suite:case("normalizesGitHubTarget", function(assert)
+		writeManifest([[return {
+	package = {
+		name = "consumer",
+		version = "1.0.0",
+		dependencies = {
+			apple = { sourceKind = "github", source = "https://github.com/owner/repo", rev = "v1", target = "./modules/apple/" },
+			root = { sourceKind = "github", source = "https://github.com/owner/repo", rev = "v1", target = "." },
+		},
+	},
+}
+]])
+
+		local parsed = manifest.parseFile(path.format(manifestPath))
+		local apple = parsed.package.dependencies.apple :: manifest.GitHubDependencySpec
+		local root = parsed.package.dependencies.root :: manifest.GitHubDependencySpec
+
+		assert.eq(apple.target, "modules/apple")
+		assert.eq(root.target, nil)
+	end)
+
+	suite:case("rejectsGitHubTargetOutsideRepository", function(assert)
+		writeManifest([[return {
+	package = {
+		name = "consumer",
+		version = "1.0.0",
+		dependencies = {
+			apple = { sourceKind = "github", source = "https://github.com/owner/repo", rev = "v1", target = "../elsewhere" },
+		},
+	},
+}
+]])
+
+		assert.throwsWith("must stay inside the repository", function()
+			manifest.parseFile(path.format(manifestPath))
+		end)
+	end)
+end)

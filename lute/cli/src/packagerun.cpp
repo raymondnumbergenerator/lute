@@ -73,6 +73,40 @@ static std::string toLower(std::string_view str)
     return result;
 }
 
+// Reads an alias -> lockfile key map into `aliases`, ignoring a missing field.
+//
+// Version 4 lockfiles keep development dependencies in a separate
+// "devDependencies" map, at the root and on member records (the direct path
+// dependencies of a virtual root). At runtime they are visible exactly like
+// regular dependencies, as root dev dependencies were in version 3, so both
+// maps are merged into one alias table. The resolver rejects an alias that
+// appears in both, so merging cannot overwrite an entry.
+//
+// Selecting which package's aliases an entry file sees needs no lockfile
+// support: UserlandVfs::resetToPath already picks the package whose
+// rootDirectory contains the entry path. Running modules/apple/main.luau from
+// the virtual root's lockfile therefore sees apple's aliases, and a root
+// script outside every package sees the root's. Known limitations of that
+// matching (plain string prefix, first match rather than longest, subtree
+// positioned at the package entry file) are tracked separately.
+static void readAliasMap(const Luau::ConfigTable& table, const char* field, std::unordered_map<std::string, std::string>& aliases)
+{
+    if (!table.contains(field))
+        return;
+
+    const Luau::ConfigTable* map = table.find(field)->get_if<Luau::ConfigTable>();
+    if (!map)
+        return;
+
+    for (const auto& [k, v] : *map)
+    {
+        const std::string* alias = k.get_if<std::string>();
+        const std::string* depKey = v.get_if<std::string>();
+        if (alias && depKey)
+            aliases[*alias] = *depKey;
+    }
+}
+
 // TODO: lockfile must specify entry file location; for now, we try out a few
 // likely candidates.
 static std::string getEntryPoint(const std::string& packageRoot)
@@ -115,9 +149,14 @@ std::pair<std::vector<Package::Identifier>, std::vector<std::pair<Package::Ident
         return {};
 
     Luau::ConfigTable* packagesTable = config["packages"].get_if<Luau::ConfigTable>();
-    Luau::ConfigTable* depsTable = config["dependencies"].get_if<Luau::ConfigTable>();
-    if (!packagesTable || !depsTable)
+    if (!packagesTable || !config["dependencies"].get_if<Luau::ConfigTable>())
         return {};
+
+    // Root aliases: the root package's dependencies plus its development
+    // dependencies. For a virtual root, these are its members.
+    std::unordered_map<std::string, std::string> rootAliases;
+    readAliasMap(config, "dependencies", rootAliases);
+    readAliasMap(config, "devDependencies", rootAliases);
 
     std::optional<std::string> lockfileParentDir = getParentPath(lockfilePath);
     if (!lockfileParentDir)
@@ -175,22 +214,13 @@ std::pair<std::vector<Package::Identifier>, std::vector<std::pair<Package::Ident
         info.entryFile = getEntryPoint(info.rootDirectory);
         keyToInfo[*packageKey] = std::move(info);
 
-        if (entry->contains("dependencies"))
-        {
-            const Luau::ConfigTable* entryDeps = (*entry).find("dependencies")->get_if<Luau::ConfigTable>();
-            if (entryDeps)
-            {
-                std::unordered_map<std::string, std::string> aliases;
-                for (const auto& [dk, dv] : *entryDeps)
-                {
-                    const std::string* alias = dk.get_if<std::string>();
-                    const std::string* depKey = dv.get_if<std::string>();
-                    if (alias && depKey)
-                        aliases[*alias] = *depKey;
-                }
-                keyToDepAliases[*packageKey] = std::move(aliases);
-            }
-        }
+        // A member's development dependencies are visible to that member only,
+        // so they join its alias table rather than the root's.
+        std::unordered_map<std::string, std::string> aliases;
+        readAliasMap(*entry, "dependencies", aliases);
+        readAliasMap(*entry, "devDependencies", aliases);
+        if (!aliases.empty() || entry->contains("dependencies"))
+            keyToDepAliases[*packageKey] = std::move(aliases);
     }
 
     // Second pass: resolve dependency aliases to Identifiers.
@@ -216,19 +246,15 @@ std::pair<std::vector<Package::Identifier>, std::vector<std::pair<Package::Ident
         }
     }
 
-    // Build direct dependencies from dependencies table (alias -> key map)
+    // Build direct dependencies from the root alias -> key maps
     std::vector<Package::Identifier> directDependencies;
-    for (const auto& [ak, av] : *depsTable)
+    for (const auto& [alias, depKey] : rootAliases)
     {
-        const std::string* alias = ak.get_if<std::string>();
-        const std::string* depKey = av.get_if<std::string>();
-        if (!alias || !depKey)
-            continue;
-        auto it = keyToIdentifier.find(*depKey);
+        auto it = keyToIdentifier.find(depKey);
         if (it != keyToIdentifier.end())
         {
             Package::Identifier aliasedId;
-            aliasedId.name = toLower(*alias);
+            aliasedId.name = toLower(alias);
             aliasedId.version = it->second.version;
             aliasedId.lockfileKey = it->second.lockfileKey;
             directDependencies.push_back(std::move(aliasedId));
@@ -248,16 +274,11 @@ std::pair<std::vector<Package::Identifier>, std::vector<std::pair<Package::Ident
 
     // directDependencies controls root-level permissions, while allDependencies
     // maps root aliases to their package source.
-    for (const auto& [ak, av] : *depsTable)
+    for (const auto& [alias, depKey] : rootAliases)
     {
-        const std::string* alias = ak.get_if<std::string>();
-        const std::string* depKey = av.get_if<std::string>();
-        if (!alias || !depKey)
-            continue;
-
-        std::string lowerAlias = toLower(*alias);
-        auto idIt = keyToIdentifier.find(*depKey);
-        auto infoIt = keyToInfo.find(*depKey);
+        std::string lowerAlias = toLower(alias);
+        auto idIt = keyToIdentifier.find(depKey);
+        auto infoIt = keyToInfo.find(depKey);
         if (idIt != keyToIdentifier.end() && infoIt != keyToInfo.end() && lowerAlias != idIt->second.name)
         {
             Package::Identifier aliasId;
