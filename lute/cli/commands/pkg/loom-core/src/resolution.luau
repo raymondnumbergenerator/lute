@@ -142,7 +142,6 @@ end
 -- `resolveSourcePackage` assigns.
 local function getMemberKeys(
 	rootManifest: manifest.ProjectManifest,
-	rootDirectory: string,
 	overrides: { [string]: manifest.DependencySpec }
 ): { [string]: boolean }
 	local members: { [string]: boolean } = {}
@@ -170,7 +169,7 @@ end
 -- repository and revision (see `store.getGitHubCheckoutKey`); `target` picks
 -- the package directory inside it. The parser keeps `target` inside the
 -- checkout; this only checks that it exists.
-local function locateSourcePackage(spec: manifest.DependencySpec, rootDirectory: string): SourceLocation
+local function locateSourcePackage(spec: manifest.DependencySpec): SourceLocation
 	if spec.sourceKind == "path" then
 		if not fs.exists(spec.directory) then
 			error(`Path dependency directory not found: {spec.directory} (for package '{spec.name}')`)
@@ -219,7 +218,7 @@ local function checkPathVersion(spec: manifest.DependencySpec, rootDirectory: st
 		return nil
 	end
 
-	local pkg = manifest.parseFile(getManifestPath(locateSourcePackage(spec, rootDirectory).directory)).package
+	local pkg = manifest.parseFile(getManifestPath(locateSourcePackage(spec).directory)).package
 	if pkg.version == nil then
 		return `Path dependency '{spec.name}' with a version requirement cannot target a virtual package`
 	end
@@ -337,7 +336,6 @@ local function collectSourcePackageDependencies(
 	state: ResolutionState,
 	key: string,
 	location: SourceLocation,
-	rootDirectory: string,
 	overrides: { [string]: manifest.DependencySpec },
 	rootRegistryUrl: string?
 )
@@ -455,7 +453,7 @@ local function resolveSourcePackage(
 	local transitiveDependencies: { [string]: string } = {}
 	state.openDependencies[key] = transitiveDependencies
 
-	local location = locateSourcePackage(spec, rootDirectory)
+	local location = locateSourcePackage(spec)
 
 	-- Opening a table here is what makes `collectSourcePackageDependencies`
 	-- collect this package's development dependencies; see `getMemberKeys`.
@@ -466,7 +464,7 @@ local function resolveSourcePackage(
 		state.openDevDependencies[key] = devDependencies
 	end
 
-	collectSourcePackageDependencies(state, key, location, rootDirectory, overrides, rootRegistryUrl)
+	collectSourcePackageDependencies(state, key, location, overrides, rootRegistryUrl)
 
 	packages[key] = table.freeze({
 		name = spec.name,
@@ -747,7 +745,7 @@ local function tryReuseLockfile(
 				overrides,
 				rootManifest.registry,
 				excludeDev,
-				getMemberKeys(rootManifest, rootDirectory, overrides)
+				getMemberKeys(rootManifest, overrides)
 			)
 		then
 			return existingLock, nil
@@ -782,8 +780,7 @@ local function collectRootDependency(
 	dependencySpec: manifest.DependencySpec,
 	registryUrl: string?,
 	overrides: { [string]: manifest.DependencySpec },
-	isDev: boolean,
-	rootDirectory: string
+	isDev: boolean
 )
 	local effectiveSpec = overrides[dependencySpec.name] or dependencySpec
 
@@ -815,7 +812,6 @@ end
 local function collectRootDependencies(
 	rootManifest: manifest.ProjectManifest,
 	overrides: { [string]: manifest.DependencySpec },
-	rootDirectory: string,
 	excludeDev: boolean
 ): ResolutionState
 	local state: ResolutionState = {
@@ -833,23 +829,14 @@ local function collectRootDependencies(
 		devDependencies = {},
 		unresolvedRegistryDevDependencies = {},
 		openDevDependencies = {},
-		memberKeys = getMemberKeys(rootManifest, rootDirectory, overrides),
+		memberKeys = getMemberKeys(rootManifest, overrides),
 	}
 
 	-- Used as `requiredBy` in solver diagnostics; a virtual root has no name.
 	local rootName = rootManifest.package.name or "virtual package"
 
 	for dependencyAlias, dependencySpec in rootManifest.package.dependencies do
-		collectRootDependency(
-			state,
-			rootName,
-			dependencyAlias,
-			dependencySpec,
-			rootManifest.registry,
-			overrides,
-			false,
-			rootDirectory
-		)
+		collectRootDependency(state, rootName, dependencyAlias, dependencySpec, rootManifest.registry, overrides, false)
 	end
 
 	if not excludeDev then
@@ -861,8 +848,7 @@ local function collectRootDependencies(
 				dependencySpec,
 				rootManifest.registry,
 				overrides,
-				true,
-				rootDirectory
+				true
 			)
 		end
 	end
@@ -1153,7 +1139,7 @@ local function resolve(rootDirectory: string, universe: semver.Universe?, option
 	end
 
 	local overrides = rootManifest.overrides
-	local state = collectRootDependencies(rootManifest, overrides, rootDirectory, excludeDev)
+	local state = collectRootDependencies(rootManifest, overrides, excludeDev)
 	queueSourceOverrides(state, overrides)
 	processSourceQueue(state, rootDirectory, overrides, rootManifest.registry, excludeDev)
 
