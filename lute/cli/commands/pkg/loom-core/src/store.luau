@@ -83,6 +83,7 @@ return {
 	getGitHubCheckoutKey = getGitHubCheckoutKey,
 	getGitHubInstallPath = getGitHubInstallPath,
 	qualifyRegistryKey = qualifyRegistryKey,
+	sha256Hex = sha256Hex,
 	ensureStoreDirectory = ensureStoreDirectory,
 	toStorePath = toStorePath,
 }
