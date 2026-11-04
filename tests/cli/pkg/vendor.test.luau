@@ -35,24 +35,62 @@ local function vendored(...: string): path.Path
 	return path.join(projectDirectory, ".lpm", ...)
 end
 
--- A path package with content_root = "src" and test files excluded.
-local function writeSharedPackage(directory: path.Path)
+local citrusArchive = buffer.tostring(zipWriter.write({
+	{ name = "init.luau", contents = buffer.fromstring("return 'citrus'\n") },
+	{
+		name = "pkg.luau",
+		contents = buffer.fromstring('return { package = { name = "citrus", version = "1.0.0" } }\n'),
+	},
+}))
+
+-- Serves citrus@1.0.0. Returns the server and its registry URL.
+local function serveCitrus(): (any, string)
+	local instance: any
+	instance = server.serve({
+		port = 0,
+		handler = function(req: server.ReceivedRequest): server.ServerResponse
+			if req.path == "/api/v1/package-index/citrus" then
+				return {
+					status = 200,
+					body = '[{"name":"citrus","version":"1.0.0","yanked":false,"dependencies":[]}]',
+				}
+			elseif req.path == "/api/v1/package-content-url/citrus/1.0.0" then
+				return {
+					status = 200,
+					body = `\{"contentUrl":"http://{instance.hostname}:{instance.port}/archive"\}`,
+				}
+			elseif req.path == "/archive" then
+				return { status = 200, body = citrusArchive }
+			end
+			return { status = 404, body = "not found" }
+		end,
+	})
+	return instance, `http://{instance.hostname}:{instance.port}`
+end
+
+-- A root package that depends on citrus, plus any extra dependency entries.
+local function writeCitrusProject(registryUrl: string, section: "dependencies" | "devDependencies", extra: string?)
+	local citrus = 'citrus = { sourceKind = "registry", source = "citrus", version = "^1.0.0" },'
+	local dependencies = (extra or "") .. if section == "dependencies" then citrus else ""
+	local devDependencies = if section == "devDependencies" then citrus else ""
 	writeManifest(
-		directory,
-		[[return {
+		projectDirectory,
+		string.format(
+			[[return {
+	registry = %q,
 	package = {
-		name = "shared",
-		version = "1.0.0",
-		content_root = "src",
-		files = { "*", "!*.test.luau" },
+		name = "root",
+		version = "0.0.0",
+		dependencies = { %s },
+		devDependencies = { %s },
 	},
 }
-]]
+]],
+			registryUrl,
+			dependencies,
+			devDependencies
+		)
 	)
-	writeFile(path.join(directory, "src", "init.luau"), "return require('./util')\n")
-	writeFile(path.join(directory, "src", "util.luau"), "return {}\n")
-	writeFile(path.join(directory, "src", "init.test.luau"), "-- test\n")
-	writeFile(path.join(directory, "tests", "spec.luau"), "-- outside content_root\n")
 end
 
 test.suite("LutePkgInstallVendor", function(suite)
@@ -76,106 +114,110 @@ test.suite("LutePkgInstallVendor", function(suite)
 		assert.eq(vendor.encodeKey("a b%"), "a%20b%25")
 	end)
 
-	suite:case("vendorsPathPackageContentRootFilteredByFiles", function(assert)
-		writeSharedPackage(path.join(workingDirectory, "shared"))
-		writeManifest(
-			projectDirectory,
-			[[return { package = { name = "root", version = "0.0.0", dependencies = {
-	shared = { sourceKind = "path", source = "../shared" },
-} } }
-]]
-		)
+	suite:case("vendorsRegistryArchiveWhole", function(assert)
+		local instance, registryUrl = serveCitrus()
+		writeCitrusProject(registryUrl, "dependencies")
 
 		local result = run("--vendor")
+		instance.close()
 
 		assert.eq(result.exitcode, 0)
 		assert.strContains(result.stdout, "Vendored 1 package(s) into .lpm.")
-		assert.that(fs.exists(vendored("shared", "init.luau")))
-		assert.that(fs.exists(vendored("shared", "util.luau")))
-		assert.that(not fs.exists(vendored("shared", "init.test.luau")))
-		assert.that(not fs.exists(vendored("shared", "pkg.luau")))
-		assert.that(not fs.exists(vendored("shared", "tests")))
-		assert.that(not fs.exists(vendored("shared", "src")))
+		assert.eq(fs.readFileToString(vendored("citrus@1.0.0", "init.luau")), "return 'citrus'\n")
+		assert.that(fs.exists(vendored("citrus@1.0.0", "pkg.luau")))
 		assert.that(fs.exists(vendored(".pkg-vendor.luau")))
 	end)
 
-	suite:case("revendoringPrunesRemovedFilesAndPackages", function(assert)
-		local sharedDirectory = path.join(workingDirectory, "shared")
-		writeSharedPackage(sharedDirectory)
-		writeManifest(
-			path.join(workingDirectory, "other"),
-			'return { package = { name = "other", version = "1.0.0" } }'
-		)
-		writeFile(path.join(workingDirectory, "other", "init.luau"), "return {}\n")
+	suite:case("leavesWorkspaceMembersInPlaceAndVendorsTheirDependencies", function(assert)
+		local instance, registryUrl = serveCitrus()
 		writeManifest(
 			projectDirectory,
-			[[return { package = { name = "root", version = "0.0.0", dependencies = {
-	shared = { sourceKind = "path", source = "../shared" },
-	other = { sourceKind = "path", source = "../other" },
-} } }
-]]
+			string.format(
+				[[return {
+	registry = %q,
+	package = { dependencies = {
+		apple = { sourceKind = "path", source = "./modules/apple" },
+		banana = { sourceKind = "path", source = "./modules/banana" },
+	} },
+}
+]],
+				registryUrl
+			)
 		)
-		assert.eq(run("--vendor").exitcode, 0)
-		assert.that(fs.exists(vendored("other", "init.luau")))
+		local apple = path.join(projectDirectory, "modules", "apple")
+		-- Each member names its own registry.
+		writeManifest(
+			apple,
+			string.format(
+				[[return { registry = %q, package = { name = "apple", version = "1.0.0", content_root = "src", dependencies = {
+	citrus = { sourceKind = "registry", source = "citrus", version = "^1.0.0" },
+} } }
+]],
+				registryUrl
+			)
+		)
+		writeFile(path.join(apple, "src", "init.luau"), "return require('@citrus')\n")
+		local banana = path.join(projectDirectory, "modules", "banana")
+		writeManifest(banana, 'return { package = { name = "banana", version = "1.0.0" } }')
+		writeFile(path.join(banana, "init.luau"), "return 'banana'\n")
 
-		fs.remove(path.join(sharedDirectory, "src", "util.luau"))
-		writeFile(path.join(sharedDirectory, "src", "nested", "deep.luau"), "return 1\n")
-		writeManifest(
-			projectDirectory,
-			[[return { package = { name = "root", version = "0.0.0", dependencies = {
-	shared = { sourceKind = "path", source = "../shared" },
-} } }
-]]
-		)
 		local result = run("--vendor")
+		instance.close()
 
 		assert.eq(result.exitcode, 0)
-		assert.that(not fs.exists(vendored("other")))
-		assert.that(not fs.exists(vendored("shared", "util.luau")))
-		assert.eq(fs.readFileToString(vendored("shared", "nested", "deep.luau")), "return 1\n")
+		assert.strContains(result.stdout, "Vendored 1 package(s) into .lpm; 2 path package(s) stay in place.")
+		assert.that(fs.exists(vendored("citrus@1.0.0", "init.luau")))
+		assert.that(not fs.exists(vendored("apple")))
+		assert.that(not fs.exists(vendored("banana")))
+	end)
+
+	suite:case("revendoringPrunesStaleEntriesAndFiles", function(assert)
+		local instance, registryUrl = serveCitrus()
+		writeCitrusProject(registryUrl, "dependencies")
+		assert.eq(run("--vendor").exitcode, 0)
+
+		-- An entry left by an older vendor, such as a path package, and a file
+		-- that is no longer in its package.
+		writeFile(vendored("shared", "init.luau"), "return {}\n")
+		writeFile(vendored("citrus@1.0.0", "nested", "stale.luau"), "return {}\n")
+		local result = run("--vendor")
+		instance.close()
+
+		assert.eq(result.exitcode, 0)
+		assert.that(not fs.exists(vendored("shared")))
+		assert.that(not fs.exists(vendored("citrus@1.0.0", "nested")))
+		assert.eq(fs.readFileToString(vendored("citrus@1.0.0", "init.luau")), "return 'citrus'\n")
 	end)
 
 	suite:case("excludeDevSkipsDevDependencies", function(assert)
-		writeSharedPackage(path.join(workingDirectory, "shared"))
-		writeManifest(
-			projectDirectory,
-			[[return { package = { name = "root", version = "0.0.0", dependencies = {}, devDependencies = {
-	shared = { sourceKind = "path", source = "../shared" },
-} } }
-]]
-		)
+		local instance, registryUrl = serveCitrus()
+		writeCitrusProject(registryUrl, "devDependencies")
 
 		local result = run("--vendor", "--exclude-dev")
+		instance.close()
 
 		assert.eq(result.exitcode, 0)
 		assert.strContains(result.stdout, "Vendored 0 package(s) into .lpm.")
-		assert.that(not fs.exists(vendored("shared")))
+		assert.that(not fs.exists(vendored("citrus@1.0.0")))
 	end)
 
-	suite:case("installWarnsWhenVendoredPathPackageChanges", function(assert)
-		local sharedDirectory = path.join(workingDirectory, "shared")
-		writeSharedPackage(sharedDirectory)
-		writeManifest(
-			projectDirectory,
-			[[return { package = { name = "root", version = "0.0.0", dependencies = {
-	shared = { sourceKind = "path", source = "../shared" },
-} } }
-]]
-		)
+	suite:case("installWarnsWhenLockfileChangesAfterVendoring", function(assert)
+		local instance, registryUrl = serveCitrus()
+		writeCitrusProject(registryUrl, "dependencies")
 		assert.eq(run("--vendor").exitcode, 0)
 
 		local clean = run()
 		assert.eq(clean.exitcode, 0)
 		assert.that(not string.find(clean.stdout, "out of date", 1, true))
 
-		-- Excluded files don't count as changes.
-		writeFile(path.join(sharedDirectory, "src", "init.test.luau"), "-- edited test\n")
-		assert.that(not string.find(run().stdout, "out of date", 1, true))
-
-		writeFile(path.join(sharedDirectory, "src", "util.luau"), "return { edited = true }\n")
+		local lib = path.join(workingDirectory, "lib")
+		writeManifest(lib, 'return { package = { name = "lib", version = "1.0.0" } }')
+		writeCitrusProject(registryUrl, "dependencies", 'lib = { sourceKind = "path", source = "../lib" },')
 		local stale = run()
+		instance.close()
+
 		assert.eq(stale.exitcode, 0)
-		assert.strContains(stale.stdout, "path package 'shared' changed; run pkg install --vendor")
+		assert.strContains(stale.stdout, ".lpm is out of date because the lockfile changed; run pkg install --vendor")
 	end)
 
 	suite:case("vendorsGitHubTargetContentRootIntoItsOwnEntry", function(assert)
@@ -234,56 +276,5 @@ test.suite("LutePkgInstallVendor", function(suite)
 		assert.that(not fs.exists(vendored("apple@feature%2Fx", "tests")))
 		assert.that(not fs.exists(vendored("apple@feature%2Fx", "pkg.luau")))
 		assert.that(not fs.exists(vendored("apple@feature")))
-	end)
-
-	suite:case("vendorsRegistryArchiveWhole", function(assert)
-		local archive = buffer.tostring(zipWriter.write({
-			{ name = "init.luau", contents = buffer.fromstring("return 'citrus'\n") },
-			{
-				name = "pkg.luau",
-				contents = buffer.fromstring('return { package = { name = "citrus", version = "1.0.0" } }\n'),
-			},
-		}))
-		local instance: any
-		instance = server.serve({
-			port = 0,
-			handler = function(req: server.ReceivedRequest): server.ServerResponse
-				if req.path == "/api/v1/package-index/citrus" then
-					return {
-						status = 200,
-						body = '[{"name":"citrus","version":"1.0.0","yanked":false,"dependencies":[]}]',
-					}
-				elseif req.path == "/api/v1/package-content-url/citrus/1.0.0" then
-					return {
-						status = 200,
-						body = `\{"contentUrl":"http://{instance.hostname}:{instance.port}/archive"\}`,
-					}
-				elseif req.path == "/archive" then
-					return { status = 200, body = archive }
-				end
-				return { status = 404, body = "not found" }
-			end,
-		})
-
-		writeManifest(
-			projectDirectory,
-			string.format(
-				[[return {
-	registry = %q,
-	package = { name = "root", version = "0.0.0", dependencies = {
-		citrus = { sourceKind = "registry", source = "citrus", version = "^1.0.0" },
-	} },
-}
-]],
-				`http://{instance.hostname}:{instance.port}`
-			)
-		)
-
-		local result = run("--vendor")
-		instance.close()
-
-		assert.eq(result.exitcode, 0)
-		assert.eq(fs.readFileToString(vendored("citrus@1.0.0", "init.luau")), "return 'citrus'\n")
-		assert.that(fs.exists(vendored("citrus@1.0.0", "pkg.luau")))
 	end)
 end)

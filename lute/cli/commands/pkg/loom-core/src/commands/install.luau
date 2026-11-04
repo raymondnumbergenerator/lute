@@ -94,9 +94,13 @@ local function install(...: string)
 
 	if shouldVendor then
 		local result = vendor.vendor(rootDirectory, lock, not excludeDev)
-		print(`Vendored {result.packageCount} package(s) into {vendor.VENDOR_DIRECTORY}.`)
+		local summary = `Vendored {result.packageCount} package(s) into {vendor.VENDOR_DIRECTORY}`
+		if result.pathPackageCount > 0 then
+			summary ..= `; {result.pathPackageCount} path package(s) stay in place`
+		end
+		print(`{summary}.`)
 	else
-		local staleReason = vendor.getStaleReason(rootDirectory, lock)
+		local staleReason = vendor.getStaleReason(rootDirectory)
 		if staleReason then
 			print(`warning: {vendor.VENDOR_DIRECTORY} is out of date because {staleReason}; run pkg install --vendor`)
 		end
